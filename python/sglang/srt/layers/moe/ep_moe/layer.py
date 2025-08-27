@@ -469,6 +469,7 @@ class DeepEPMoE(EPMoE):
                         signal=signal,
                         block_m=block_m,
                         threshold=threshold,
+                        valid_sm=3,
                     )
                 current_stream.wait_stream(alt_stream)
             else:
@@ -863,6 +864,7 @@ class DeepEPMoE(EPMoE):
             signal,
             expected_m,
             down_start_event,
+            3,
             recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
 
