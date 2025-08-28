@@ -44,6 +44,37 @@ def grouped_gemm_nt_f8f8bf16_masked(
         )
 
 
+def grouped_gemm_nt_f8f8bf16_signal(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    signal: torch.Tensor,
+    expected_m: int,
+    invalid_sms: int = 3,
+    gemm_start_event: torch.cuda.Event = None,
+):
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_SIGNAL
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        with configure_deep_gemm_num_invalid_sms(invalid_sms):
+            if gemm_start_event is not None:
+                gemm_start_event.record()
+
+            return deep_gemm.m_grouped_fp8_gemm_nt_signal(
+                lhs,
+                rhs,
+                out,
+                masked_m,
+                signal,
+                expected_m,
+            )
+
+
 def grouped_gemm_nt_f8f8bf16_contig(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -87,6 +118,19 @@ def configure_deep_gemm_num_sms(num_sms):
     else:
         original_num_sms = deep_gemm.get_num_sms()
         deep_gemm.set_num_sms(num_sms)
+        try:
+            yield
+        finally:
+            deep_gemm.set_num_sms(original_num_sms)
+
+
+@contextmanager
+def configure_deep_gemm_num_invalid_sms(num_invalid_sms):
+    if num_invalid_sms is None:
+        yield
+    else:
+        original_num_sms = deep_gemm.get_num_sms()
+        deep_gemm.set_num_sms(original_num_sms - num_invalid_sms)
         try:
             yield
         finally:
