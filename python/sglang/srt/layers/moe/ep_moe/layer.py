@@ -844,14 +844,13 @@ class DeepEPMoE(EPMoE):
             (
                 down_input_scale
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
-                    down_input_scale
-                )
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(down_input_scale)
             ),
         )
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
+
         block_m, threshold = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_signal(
             down_input_fp8,
             self.w2_weight_fp8,
