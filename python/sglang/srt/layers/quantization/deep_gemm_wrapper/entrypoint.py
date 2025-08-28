@@ -51,7 +51,6 @@ def grouped_gemm_nt_f8f8bf16_signal(
     masked_m: torch.Tensor,
     signal: torch.Tensor,
     expected_m: int,
-    invalid_sms: int = 3,
     gemm_start_event: torch.cuda.Event = None,
 ):
     num_groups, _, k = lhs[0].shape
@@ -61,7 +60,7 @@ def grouped_gemm_nt_f8f8bf16_signal(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        with configure_deep_gemm_num_invalid_sms(invalid_sms):
+        with configure_deep_gemm_num_invalid_sms(compile_utils._NUM_SMS_SBO_COMM):
             if gemm_start_event is not None:
                 gemm_start_event.record()
 

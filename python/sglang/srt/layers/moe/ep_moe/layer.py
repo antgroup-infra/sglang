@@ -440,6 +440,8 @@ class DeepEPMoE(EPMoE):
             )
             return hidden_states
         else:
+            num_sms_sbo_comm = global_server_args_dict().get("num_sms_sbo_comm", 3)
+
             event = params["down_start_event"]
             alt_stream = params["alt_stream"]
             shared_experts = params["shared_experts"]
@@ -479,6 +481,7 @@ class DeepEPMoE(EPMoE):
                     signal=signal,
                     block_m=block_m,
                     threshold=threshold,
+                    valid_sm=num_sms_sbo_comm,
                 )
             return hidden_states, shared_output
 
@@ -858,7 +861,6 @@ class DeepEPMoE(EPMoE):
             signal,
             expected_m,
             down_start_event,
-            3,
             recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
 

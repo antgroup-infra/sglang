@@ -255,6 +255,7 @@ class ServerArgs:
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
+    num_sms_sbo_comm: int = 3
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -1831,6 +1832,12 @@ class ServerArgs:
             "--enable-single-batch-overlap",
             action="store_true",
             help="Decode enables single batch overlap.",
+        )
+        parser.add_argument(
+            "--num-sms-sbo-comm",
+            type=int,
+            default=ServerArgs.num_sms_sbo_comm,
+            help="The number of sms used for single batch overlap communication.",
         )
         parser.add_argument(
             "--tbo-token-distribution-threshold",

@@ -10,6 +10,9 @@ from tqdm import tqdm
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
 )
+from sglang.srt.layers.quantization.deep_gemm_wrapper.entrypoint import (
+    configure_deep_gemm_num_invalid_sms,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div, get_bool_env_var, get_int_env_var
 
@@ -24,6 +27,7 @@ _ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
     "SGL_JIT_DEEPGEMM_PRECOMPILE", "true"
 )
 _DO_COMPILE_ALL = True
+_NUM_SMS_SBO_COMM = 3
 _IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGL_IS_FIRST_RANK_ON_NODE", "true")
 _COMPILE_WORKERS = get_int_env_var("SGL_JIT_DEEPGEMM_COMPILE_WORKERS", 4)
 _IN_PRECOMPILE_STAGE = get_bool_env_var("SGL_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
@@ -43,6 +47,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
+    global _NUM_SMS_SBO_COMM
 
     # Generate m_max
     m_max = 1024 * 16
@@ -60,6 +65,8 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     # load all symbols at the launch stages.
     # Avoid loading symbols at the serving stages.
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
+
+    _NUM_SMS_SBO_COMM = server_args.num_sms_sbo_comm
 
 
 class DeepGemmKernelType(IntEnum):
@@ -239,15 +246,16 @@ class _GroupedSignalWarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        deep_gemm.m_grouped_fp8_gemm_nt_signal(
-            (self.lhs_q, self.lhs_s),
-            (self.rhs_q, self.rhs_s),
-            self.out,
-            masked_m=self.masked_m,
-            signal=self.combine_signal,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
-            expected_m=m,
-        )
+        with configure_deep_gemm_num_invalid_sms(_NUM_SMS_SBO_COMM):
+            deep_gemm.m_grouped_fp8_gemm_nt_signal(
+                (self.lhs_q, self.lhs_s),
+                (self.rhs_q, self.rhs_s),
+                self.out,
+                masked_m=self.masked_m,
+                signal=self.combine_signal,
+                # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+                expected_m=m,
+            )
 
 
 @contextmanager
