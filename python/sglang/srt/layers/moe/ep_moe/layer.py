@@ -440,7 +440,7 @@ class DeepEPMoE(EPMoE):
             )
             return hidden_states
         else:
-            num_sms_sbo_comm = global_server_args_dict().get("num_sms_sbo_comm", 3)
+            num_sms_sbo_comm = global_server_args_dict.get("num_sms_sbo_comm", 3)
 
             event = params["down_start_event"]
             alt_stream = params["alt_stream"]
