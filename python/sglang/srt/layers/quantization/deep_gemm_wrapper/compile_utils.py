@@ -10,9 +10,6 @@ from tqdm import tqdm
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.layers.quantization.deep_gemm_wrapper.entrypoint import (
-    configure_deep_gemm_num_invalid_sms,
-)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div, get_bool_env_var, get_int_env_var
 
@@ -264,3 +261,16 @@ def deep_gemm_execution_hook(
 ):
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield
+
+
+@contextmanager
+def configure_deep_gemm_num_invalid_sms(num_invalid_sms):
+    if num_invalid_sms is None:
+        yield
+    else:
+        original_num_sms = deep_gemm.get_num_sms()
+        deep_gemm.set_num_sms(original_num_sms - num_invalid_sms)
+        try:
+            yield
+        finally:
+            deep_gemm.set_num_sms(original_num_sms)
