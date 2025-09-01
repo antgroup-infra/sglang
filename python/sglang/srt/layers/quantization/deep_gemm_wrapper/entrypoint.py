@@ -53,6 +53,7 @@ def grouped_gemm_nt_f8f8bf16_signal(
     expected_m: int,
     gemm_start_event: torch.cuda.Event = None,
 ):
+    max_block_n = 160 if expected_m <= 32 else 256
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_SIGNAL
@@ -71,6 +72,7 @@ def grouped_gemm_nt_f8f8bf16_signal(
                 masked_m,
                 signal,
                 expected_m,
+                max_block_n=max_block_n,
             )
 
 
