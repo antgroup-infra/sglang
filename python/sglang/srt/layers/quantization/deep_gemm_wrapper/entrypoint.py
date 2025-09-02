@@ -52,16 +52,19 @@ def grouped_gemm_nt_f8f8bf16_signal(
     signal: torch.Tensor,
     expected_m: int,
     gemm_start_event: torch.cuda.Event = None,
+    num_sms_sbo_comm: int = None,
+    max_block_n: int = None,
 ):
-    max_block_n = 160 if expected_m <= 32 else 256
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_SIGNAL
+    if num_sms_sbo_comm is None:
+        num_sms_sbo_comm = compile_utils._NUM_SMS_SBO_COMM
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        with configure_deep_gemm_num_invalid_sms(compile_utils._NUM_SMS_SBO_COMM):
+        with configure_deep_gemm_num_invalid_sms(num_sms_sbo_comm):
             if gemm_start_event is not None:
                 gemm_start_event.record()
 

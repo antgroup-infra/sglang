@@ -440,14 +440,26 @@ class DeepEPMoE(EPMoE):
             )
             return hidden_states
         else:
-            num_sms_sbo_comm = global_server_args_dict.get("num_sms_sbo_comm", 3)
-
             event = params["down_start_event"]
             alt_stream = params["alt_stream"]
             shared_experts = params["shared_experts"]
             dispatch_output, shared_output = self.dispatch(
                 hidden_states, topk_idx, topk_weights, forward_batch, shared_experts=shared_experts, enable_shared_experts_overlap=True
             )
+
+            num_sms_sbo_comm = global_server_args_dict.get("num_sms_sbo_comm", 3)
+            max_block_n = 256
+            expected_m = dispatch_output.expected_m
+
+            if expected_m <= 24:
+                max_block_n = 256
+                num_sms_sbo_comm = 2
+            elif expected_m <= 32:
+                max_block_n = 160
+                num_sms_sbo_comm = 3
+            else:
+                max_block_n = 256
+                num_sms_sbo_comm = 3
 
             num_experts = params["num_experts"]
             tp_size = params["tp_size"]
@@ -456,7 +468,7 @@ class DeepEPMoE(EPMoE):
                 ((dispatch_output[0][0].shape[1] + MIN_BLOCK_M - 1) // MIN_BLOCK_M)
             signal = torch.zeros(max_signal_size, dtype=torch.int32, device=dispatch_output[0][0].device)
 
-            hidden_states, block_m, threshold = self.forward_deepgemm_signal(dispatch_output, signal, event)
+            hidden_states, block_m, threshold = self.forward_deepgemm_signal(dispatch_output, signal, event, num_sms_sbo_comm, max_block_n)
             if alt_stream is not None:
                 current_stream = torch.cuda.current_stream()
                 alt_stream.wait_event(event)
@@ -787,6 +799,8 @@ class DeepEPMoE(EPMoE):
         dispatch_output: DeepEPLLOutput,
         signal: torch.Tensor,
         down_start_event: torch.cuda.Event,
+        num_sms_sbo_comm: int,
+        max_block_n: int,
     ):
         hidden_states_fp8, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
@@ -860,6 +874,8 @@ class DeepEPMoE(EPMoE):
             signal,
             expected_m,
             down_start_event,
+            num_sms_sbo_comm,
+            max_block_n,
         )
 
         return down_output, block_m, threshold
