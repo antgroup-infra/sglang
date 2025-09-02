@@ -446,15 +446,10 @@ class DeepEPMoE(EPMoE):
             max_block_n = 256
             expected_m = dispatch_output.expected_m
 
-            if expected_m <= 24:
-                max_block_n = 256
-                num_sms_sbo_comm = 2
-            elif expected_m <= 32:
+            if expected_m <= 32:
                 max_block_n = 160
-                num_sms_sbo_comm = 3
             else:
                 max_block_n = 256
-                num_sms_sbo_comm = 3
 
             num_experts = params["num_experts"]
             tp_size = params["tp_size"]
