@@ -469,7 +469,7 @@ class DeepEPMoE(EPMoE):
                         signal=signal,
                         block_m=block_m,
                         threshold=threshold,
-                        valid_sm=3,
+                        valid_sm=num_sms_sbo_comm,
                     )
                 current_stream.wait_stream(alt_stream)
             else:
@@ -481,7 +481,8 @@ class DeepEPMoE(EPMoE):
                     signal=signal,
                     block_m=block_m,
                     threshold=threshold,
-                    valid_sm=num_sms_sbo_comm,
+                    # TODO: When use single stream, set valid_sm to all sms.
+                    valid_sm=72,
                 )
             return hidden_states, shared_output
 
