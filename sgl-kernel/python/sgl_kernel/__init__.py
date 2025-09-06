@@ -77,6 +77,7 @@ from sgl_kernel.memory import set_kv_buffer_kernel
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
+    ep_moe_pre_reorder,
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
