@@ -1518,6 +1518,16 @@ def get_device_name(device_id: int = 0) -> str:
         return torch.npu.get_device_name(device_id)
 
 
+@lru_cache(maxsize=None)
+def get_current_device_name():
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        gpu_name = torch.cuda.get_device_name(device).replace(" ", "_")
+        return gpu_name
+    else:
+        return None
+
+
 @lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None

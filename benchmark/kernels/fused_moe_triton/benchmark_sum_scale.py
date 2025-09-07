@@ -1,7 +1,13 @@
+from typing import Dict
+
 import torch
 import triton
 import triton.language as tl
 from triton.testing import do_bench
+
+from sglang.srt.layers.moe.fused_moe_triton.moe_sum_reduce_config import (
+    MoeSumReduceKernelConfig,
+)
 
 
 @triton.jit
@@ -58,18 +64,30 @@ def _moe_sum_reduce_kernel(
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 def moe_sum_reduce(
-    input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
+    input: torch.Tensor,
+    output: torch.Tensor,
+    routed_scaling_factor: float,
+    run_config: Dict = None,
 ):
+
     assert input.is_contiguous()
     assert output.is_contiguous()
 
     token_num, topk_num, hidden_dim = input.shape
     assert output.shape[0] == token_num and output.shape[1] == hidden_dim
 
-    BLOCK_M = 1
-    BLOCK_DIM = 2048
-    NUM_STAGE = 1
-    num_warps = 16
+    if not run_config:
+        run_config = MoeSumReduceKernelConfig.try_to_get_best_config(
+            M=token_num,
+            topk_num=topk_num,
+            hidden_dim=hidden_dim,
+            out_dtype=str(output.dtype),
+        )
+
+    BLOCK_M = run_config["BLOCK_M"]
+    BLOCK_DIM = run_config["BLOCK_DIM"]
+    NUM_STAGE = run_config["NUM_STAGE"]
+    num_warps = run_config["num_warps"]
 
     grid = (
         triton.cdiv(token_num, BLOCK_M),

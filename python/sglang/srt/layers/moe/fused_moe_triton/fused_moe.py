@@ -582,7 +582,7 @@ def fused_experts_impl(
                 )
             else:
                 # According to micro benchmark results, torch.compile can get better performance for small token.
-                if tokens_in_chunk <= 32:
+                if tokens_in_chunk <= 8:
                     moe_sum_reduce_torch_compile(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],

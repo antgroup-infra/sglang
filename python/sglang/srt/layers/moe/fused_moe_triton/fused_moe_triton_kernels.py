@@ -7,6 +7,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_kernel_config import (
+    FusedMoeKernelConfig,
+)
+from sglang.srt.layers.moe.fused_moe_triton.moe_sum_reduce_config import (
+    MoeSumReduceKernelConfig,
+)
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -108,6 +114,7 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
+    num_stages: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -344,6 +351,7 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
+    num_stages: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -557,6 +565,7 @@ def invoke_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    run_config: Optional[dict] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -608,13 +617,34 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+    if run_config is None:
+        run_config = FusedMoeKernelConfig.try_to_get_optimal_kernel_config(
+            M=sorted_token_ids.shape[0],
+            N=B.shape[1],
+            K=B.shape[2] - padded_size,
+            topk_num=top_k,
+            expert_num=B.shape[0],
+            mul_routed_weight=mul_routed_weight,
+            use_fp8_w8a8=use_fp8_w8a8,
+            out_dtype=str(C.dtype),
+            is_marlin=False,
+            block_shape=block_shape,
+        )
+
+    BLOCK_SIZE_M = run_config["BLOCK_SIZE_M"]
+    BLOCK_SIZE_N = run_config["BLOCK_SIZE_N"]
+    BLOCK_SIZE_K = run_config["BLOCK_SIZE_K"]
+    GROUP_SIZE_M = run_config["GROUP_SIZE_M"]
+    num_warps = run_config["num_warps"]
+    NUM_STAGE = run_config["NUM_STAGE"]
+
+    grid = (
+        triton.cdiv(sorted_token_ids.shape[0], run_config["BLOCK_SIZE_M"])
+        * triton.cdiv(B.shape[1], run_config["BLOCK_SIZE_N"]),
     )
 
     K = B.shape[2] - padded_size
-    if K % config["BLOCK_SIZE_K"] == 0:
+    if K % run_config["BLOCK_SIZE_K"] == 0:
         even_Ks = True
     else:
         even_Ks = False
@@ -655,6 +685,10 @@ def invoke_fused_moe_kernel(
             B_zp.stride(2) if B_zp is not None else 0,
             B_zp.stride(1) if B_zp is not None else 0,
             group_size=block_shape[1],
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
@@ -662,7 +696,8 @@ def invoke_fused_moe_kernel(
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
-            **config,
+            num_warps=num_warps,
+            num_stages=NUM_STAGE,
         )
 
     else:
@@ -698,6 +733,10 @@ def invoke_fused_moe_kernel(
             B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
             0 if block_shape is None else block_shape[0],
             0 if block_shape is None else block_shape[1],
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
@@ -706,7 +745,8 @@ def invoke_fused_moe_kernel(
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
-            **config,
+            num_warps=num_warps,
+            num_stages=NUM_STAGE,
         )
 
 
@@ -764,18 +804,30 @@ def _moe_sum_reduce_kernel(
 
 
 def moe_sum_reduce_triton(
-    input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
+    input: torch.Tensor,
+    output: torch.Tensor,
+    routed_scaling_factor: float,
+    run_config: Dict = None,
 ):
+
     assert input.is_contiguous()
     assert output.is_contiguous()
 
     token_num, topk_num, hidden_dim = input.shape
     assert output.shape[0] == token_num and output.shape[1] == hidden_dim
 
-    BLOCK_M = 1
-    BLOCK_DIM = 2048
-    NUM_STAGE = 1
-    num_warps = 16
+    if not run_config:
+        run_config = MoeSumReduceKernelConfig.try_to_get_optimal_kernel_config(
+            M=token_num,
+            topk_num=topk_num,
+            hidden_dim=hidden_dim,
+            out_dtype=str(output.dtype),
+        )
+
+    BLOCK_M = run_config["BLOCK_M"]
+    BLOCK_DIM = run_config["BLOCK_DIM"]
+    NUM_STAGE = run_config["NUM_STAGE"]
+    num_warps = run_config["num_warps"]
 
     grid = (
         triton.cdiv(token_num, BLOCK_M),
