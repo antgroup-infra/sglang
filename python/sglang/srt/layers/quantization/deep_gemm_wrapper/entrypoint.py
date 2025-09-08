@@ -63,7 +63,7 @@ def grouped_gemm_nt_f8f8bf16_signal(
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_SIGNAL
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_OVERLAP
     if num_sms_sbo_comm is None:
         num_sms_sbo_comm = compile_utils._NUM_SMS_SBO_COMM
 
@@ -74,14 +74,15 @@ def grouped_gemm_nt_f8f8bf16_signal(
             if gemm_start_event is not None:
                 gemm_start_event.record()
 
-            return deep_gemm.m_grouped_fp8_gemm_nt_signal(
+            return deep_gemm.m_grouped_fp8_gemm_nt_masked(
                 lhs,
                 rhs,
                 out,
                 masked_m,
-                signal,
                 expected_m,
                 max_block_n=max_block_n,
+                enable_overlap=True,
+                signal=signal,
             )
 
 

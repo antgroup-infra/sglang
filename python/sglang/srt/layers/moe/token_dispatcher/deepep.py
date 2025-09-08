@@ -769,7 +769,7 @@ class _DeepEPDispatcherImplLowLatencyOverlap(_DeepEPDispatcherImplBase):
         valid_sm: int,
     ):
         buffer = self._get_buffer()
-        combined_hidden_states, event, hook = buffer.ll_overlap_combine(
+        combined_hidden_states, event, hook = buffer.low_latency_combine(
             hidden_states,
             topk_idx,
             topk_weights,

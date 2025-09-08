@@ -69,7 +69,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
-    GROUPED_GEMM_NT_F8F8BF16_SIGNAL = auto()
+    GROUPED_GEMM_NT_F8F8BF16_OVERLAP = auto()
     GEMM_NT_F8F8BF16 = auto()
 
 
@@ -157,7 +157,7 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_SIGNAL: _GroupedSignalWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_OVERLAP: _GroupedOverlapWarmupExecutor,
         }[kernel_type](**kwargs)
 
     def execute(self, m):
@@ -239,27 +239,27 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
-class _GroupedSignalWarmupExecutor(_BaseWarmupExecutor):
+class _GroupedOverlapWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
         max_signal_size = num_groups * ceil_div(max_m, 64)
-        self.combine_signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
+        self.signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
         self.out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
 
     def execute(self, m):
         with configure_deep_gemm_num_invalid_sms(_NUM_SMS_SBO_COMM):
-            deep_gemm.m_grouped_fp8_gemm_nt_signal(
+            deep_gemm.m_grouped_fp8_gemm_nt_masked(
                 (self.lhs_q, self.lhs_s),
                 (self.rhs_q, self.rhs_s),
                 self.out,
                 masked_m=self.masked_m,
-                signal=self.combine_signal,
-                # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
                 expected_m=m,
+                enable_overlap=True,
+                signal=self.signal,
             )
 
 
