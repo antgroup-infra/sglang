@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "hybrid_linear_attn",
     # AMD specific
     "aiter",
     "wave",
@@ -223,6 +225,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
+    prefill_round_robin_balance: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -389,10 +393,15 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Mamba cache
+    max_mamba_cache_size: Optional[int] = None
+    mamba_ssm_dtype: str = "float32"
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_cutedsl_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
@@ -413,6 +422,11 @@ class ServerArgs:
             self.moe_runner_backend = "triton_kernel"
             print_deprecated_warning(
                 "NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead."
+            )
+        if self.enable_flashinfer_cutedsl_moe:
+            self.moe_runner_backend = "flashinfer_cutedsl"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead."
             )
         if self.enable_flashinfer_cutlass_moe:
             self.moe_runner_backend = "flashinfer_cutlass"
@@ -625,12 +639,12 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if self.dp_size == 1:
+            self.enable_dp_attention = False
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert (
-                self.dp_size > 1
-            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
             assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
@@ -653,11 +667,13 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            if not self.disable_shared_experts_fusion:
-                self.disable_shared_experts_fusion = True
-                logger.warning(
-                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-                )
+            assert (
+                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
+            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -716,6 +732,13 @@ class ServerArgs:
             self.hicache_io_backend = "kernel"
             self.hicache_mem_layout = "page_first"
 
+        if self.hicache_mem_layout == "page_first_direct":
+            if self.hicache_io_backend != "direct":
+                self.hicache_io_backend = "direct"
+                logger.warning(
+                    "Page first direct layout only support direct io backend"
+                )
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
@@ -742,7 +765,12 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
+            if model_arch in [
+                "DeepseekV3ForCausalLM",
+                "Glm4MoeForCausalLM",
+                "BailingMoeForCausalLM",
+                "BailingMoeV2ForCausalLM",
+            ]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -818,6 +846,13 @@ class ServerArgs:
 
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+
+            if self.dp_size > 1 and not is_in_ci():
+                assert self.prefill_round_robin_balance, (
+                    "Prefill round robin balance is required when dp size > 1. "
+                    "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
+                    " and `--prefill-round-robin-balance` is set for decode server."
+                )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
@@ -834,6 +869,8 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
+        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
+
         # Set env var before grammar backends init
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
@@ -862,12 +899,6 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
-            "--tokenizer-worker-num",
-            type=int,
-            default=ServerArgs.tokenizer_worker_num,
-            help="The worker num of the tokenizer manager.",
-        )
-        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -875,6 +906,12 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -1066,7 +1103,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1395,6 +1432,12 @@ class ServerArgs:
                 "minimum_tokens",
             ],
         )
+        parser.add_argument(
+            "--prefill-round-robin-balance",
+            default=ServerArgs.prefill_round_robin_balance,
+            action="store_true",
+            help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -1526,6 +1569,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--speculative-draft-model-path",
+            "--speculative-draft-model",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
         )
@@ -1607,6 +1651,7 @@ class ServerArgs:
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
                 "flashinfer_mxfp4",
+                "flashinfer_cutedsl",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
@@ -1614,7 +1659,7 @@ class ServerArgs:
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
-            choices=["mxfp4", "bf16"],
+            choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
@@ -1707,6 +1752,21 @@ class ServerArgs:
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
         )
 
+        # Mamba Cache
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum size of the mamba cache.",
+        )
+        parser.add_argument(
+            "--mamba-ssm-dtype",
+            type=str,
+            default=ServerArgs.mamba_ssm_dtype,
+            choices=["float32", "bfloat16"],
+            help="The data type of the SSM states in mamba cache.",
+        )
+
         # Hierarchical cache
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -1742,7 +1802,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-mem-layout",
             type=str,
-            choices=["layer_first", "page_first"],
+            choices=["layer_first", "page_first", "page_first_direct"],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
         )
@@ -2186,6 +2246,11 @@ class ServerArgs:
             help="(Deprecated) Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
         )
         parser.add_argument(
+            "--enable-flashinfer-cutedsl-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CuteDSL MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
@@ -2207,6 +2272,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -2685,6 +2751,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
     ]:
         # The default value for deepseek and gpt-oss
         return (3, 1, 4)

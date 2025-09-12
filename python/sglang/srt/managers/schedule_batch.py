@@ -38,7 +38,7 @@ import threading
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -59,7 +59,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.lora_radix_cache import LoRAKey, LoRARadixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -913,7 +913,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     @classmethod
     def init_new(
@@ -964,8 +964,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def alloc_req_slots(self, num_reqs: int):
-        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+    def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
+        else:
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
@@ -1140,7 +1143,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate req slots
         bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(bs, self.reqs)
 
         # Init tensors
         reqs = self.reqs
@@ -1899,7 +1902,7 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
