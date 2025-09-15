@@ -36,53 +36,12 @@ __device__ __forceinline__ T ldg_cg(const T* p) {
   return __ldg(p);
 }
 
-__device__ __forceinline__ float bf16_to_float_bits(uint16_t h) {
-  uint32_t u = ((uint32_t)h) << 16;
-  return __uint_as_float(u);
-}
-__device__ __forceinline__ uint16_t float_to_bf16_rne(float x) {
-  uint32_t u = __float_as_uint(x);
-  uint32_t lsb = (u >> 16) & 1u;
-  uint32_t rounding_bias = 0x7FFFu + lsb;
-  return (uint16_t)((u + rounding_bias) >> 16);
-}
-
 union Pack16B {
   uint4 v;
-  uint16_t u16[8];
+  __nv_bfloat16 u16[8];
 };
 
-// warp-per-token for dynamic topk
-template <typename scalar_t, int WARPS_PER_BLOCK>
-__global__ void moe_sum_reduce_kernel_warp_token_generic(
-    const scalar_t* __restrict__ x,
-    scalar_t* __restrict__ y,
-    const int64_t token_num,
-    const int64_t topk_num,
-    const int64_t hidden_dim,
-    const int64_t stride_token,
-    const int64_t stride_topk,
-    const int64_t out_stride_token,
-    const float scale) {
-  const int warp_id = threadIdx.x / 32;
-  const int lane = threadIdx.x % 32;
-  const int64_t t = (int64_t)blockIdx.y * WARPS_PER_BLOCK + warp_id;
-  if (t >= token_num) return;
-
-  for (int64_t d = (int64_t)blockIdx.x * 32 + lane; d < hidden_dim; d += (int64_t)gridDim.x * 32) {
-    float acc = 0.f;
-    const int64_t base = t * stride_token + d;
-
-#pragma unroll 8
-    for (int64_t k = 0; k < topk_num; ++k) {
-      acc += to_float<scalar_t>(ldg_cg(&x[base + k * stride_topk]));
-    }
-    acc *= scale;
-    y[t * out_stride_token + d] = from_float<scalar_t>(acc);
-  }
-}
-
-template <int WARPS_PER_BLOCK, int VEC = 32>
+template <int WARPS_PER_BLOCK, int VEC = 16>
 __global__ void moe_sum_reduce_kernel_warp_token_topk_bf16_vec(
     const at::BFloat16* __restrict__ x,
     at::BFloat16* __restrict__ y,
@@ -122,7 +81,7 @@ __global__ void moe_sum_reduce_kernel_warp_token_topk_bf16_vec(
 
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-          acc[p * 8 + i] += bf16_to_float_bits(pack.u16[i]);
+          acc[p * 8 + i] += __bfloat162float(pack.u16[i]);
         }
       }
     }
@@ -136,7 +95,7 @@ __global__ void moe_sum_reduce_kernel_warp_token_topk_bf16_vec(
       Pack16B outp;
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        outp.u16[i] = float_to_bf16_rne(acc[p * 8 + i]);
+        outp.u16[i] = __float2bfloat16_rn(acc[p * 8 + i]);
       }
       const int64_t dst = t * out_stride_token + d + p * 8;
       *reinterpret_cast<uint4*>(y + dst) = outp.v;
@@ -172,33 +131,6 @@ __global__ void moe_sum_reduce_kernel_warp_token_topk(
   }
 }
 
-template <typename scalar_t>
-__global__ void moe_sum_reduce_kernel_generic(
-    const scalar_t* __restrict__ x,
-    scalar_t* __restrict__ y,
-    const int64_t token_num,
-    const int64_t topk_num,
-    const int64_t hidden_dim,
-    const int64_t stride_token,      // input.stride(0)
-    const int64_t stride_topk,       // input.stride(1)
-    const int64_t out_stride_token,  // output.stride(0)
-    const float scale) {
-  for (int64_t t = blockIdx.y; t < token_num; t += gridDim.y) {
-    // grid-stride loop hidden_dim
-    for (int64_t d = blockIdx.x * blockDim.x + threadIdx.x; d < hidden_dim; d += (int64_t)blockDim.x * gridDim.x) {
-      float acc = 0.f;
-      const int64_t base = t * stride_token + d;
-
-#pragma unroll 8
-      for (int64_t k = 0; k < topk_num; ++k) {
-        acc += to_float<scalar_t>(x[base + k * stride_topk]);
-      }
-      acc *= scale;
-      y[t * out_stride_token + d] = from_float<scalar_t>(acc);
-    }
-  }
-}
-
 template <typename scalar_t, int TOPK>
 __global__ void moe_sum_reduce_kernel_topk(
     const scalar_t* __restrict__ x,
@@ -209,8 +141,8 @@ __global__ void moe_sum_reduce_kernel_topk(
     const int64_t stride_topk,
     const int64_t out_stride_token,
     const float scale) {
-  for (int64_t t = blockIdx.y; t < token_num; t += gridDim.y) {
-    for (int64_t d = blockIdx.x * blockDim.x + threadIdx.x; d < hidden_dim; d += (int64_t)blockDim.x * gridDim.x) {
+  for (int t = blockIdx.y; t < token_num; t += gridDim.y) {
+    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < hidden_dim; d += blockDim.x * gridDim.x) {
       const int64_t base = t * stride_token + d;
       float acc = 0.f;
 
@@ -248,11 +180,11 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  const bool fast_bf16_vec_ok = (input.scalar_type() == at::kBFloat16) && (token_num > 8) && (hidden_dim % 8 == 0);
+  const bool fast_bf16_vec_ok = (input.scalar_type() == at::kBFloat16) && (token_num > 256) && (hidden_dim % 8 == 0);
 
   // Fast path for bf16 vectorize
   if (fast_bf16_vec_ok) {
-    constexpr int WARPS_PER_BLOCK = 16;
+    constexpr int WARPS_PER_BLOCK = 8;
     constexpr int THREADS = WARPS_PER_BLOCK * 32;
 
     const int64_t n_chunks = hidden_dim / 8;
@@ -318,39 +250,25 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         at::kHalf, at::kBFloat16, input.scalar_type(), "moe_sum_reduce_cuda_small_token", [&] {
           using scalar_t_ = scalar_t;
 
-          auto launch_small = [&](auto integral_c) {
-            constexpr int TK = decltype(integral_c)::value;
+          auto launch_small = [&](auto topk_c) {
+            constexpr int TK = decltype(topk_c)::value;
 
-            if constexpr (TK != -1) {
-              moe_sum_reduce_kernel_topk<scalar_t_, TK><<<grid, block, 0, stream>>>(
-                  input.data_ptr<scalar_t_>(),
-                  output.data_ptr<scalar_t_>(),
-                  token_num,
-                  hidden_dim,
-                  in_stride_token,
-                  in_stride_topk,
-                  out_stride_token,
-                  scale);
-            } else {
-              moe_sum_reduce_kernel_generic<scalar_t_><<<grid, block, 0, stream>>>(
-                  input.data_ptr<scalar_t_>(),
-                  output.data_ptr<scalar_t_>(),
-                  token_num,
-                  topk_num,
-                  hidden_dim,
-                  in_stride_token,
-                  in_stride_topk,
-                  out_stride_token,
-                  scale);
-            }
+            moe_sum_reduce_kernel_topk<scalar_t_, TK><<<grid, block, 0, stream>>>(
+                input.data_ptr<scalar_t_>(),
+                output.data_ptr<scalar_t_>(),
+                token_num,
+                hidden_dim,
+                in_stride_token,
+                in_stride_topk,
+                out_stride_token,
+                scale);
           };
-
           dispatch_topk(launch_small);
         });
 
   } else {
     // ---------- warp-token ----------
-    constexpr int WARPS_PER_BLOCK = 16;
+    constexpr int WARPS_PER_BLOCK = 4;
     constexpr int THREADS = WARPS_PER_BLOCK * 32;
 
     int64_t gx = (hidden_dim + 32 - 1) / 32;
@@ -366,33 +284,19 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         at::kHalf, at::kBFloat16, input.scalar_type(), "moe_sum_reduce_cuda_large_token", [&] {
           using scalar_t_ = scalar_t;
 
-          auto launch_large = [&](auto integral_c) {
-            constexpr int TK = decltype(integral_c)::value;
+          auto launch_large = [&](auto topk_c) {
+            constexpr int TK = decltype(topk_c)::value;
 
-            if constexpr (TK != -1) {
-              moe_sum_reduce_kernel_warp_token_topk<scalar_t_, TK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                  input.data_ptr<scalar_t_>(),
-                  output.data_ptr<scalar_t_>(),
-                  token_num,
-                  hidden_dim,
-                  in_stride_token,
-                  in_stride_topk,
-                  out_stride_token,
-                  scale);
-            } else {
-              moe_sum_reduce_kernel_warp_token_generic<scalar_t_, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                  input.data_ptr<scalar_t_>(),
-                  output.data_ptr<scalar_t_>(),
-                  token_num,
-                  topk_num,
-                  hidden_dim,
-                  in_stride_token,
-                  in_stride_topk,
-                  out_stride_token,
-                  scale);
-            }
+            moe_sum_reduce_kernel_warp_token_topk<scalar_t_, TK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+                input.data_ptr<scalar_t_>(),
+                output.data_ptr<scalar_t_>(),
+                token_num,
+                hidden_dim,
+                in_stride_token,
+                in_stride_topk,
+                out_stride_token,
+                scale);
           };
-
           dispatch_topk(launch_large);
         });
   }
