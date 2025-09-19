@@ -169,7 +169,7 @@ class DeepEPBuffer:
         if deepep_mode == DeepEPMode.NORMAL:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms
-        elif deepep_mode == DeepEPMode.LOW_LATENCY:
+        elif deepep_mode == DeepEPMode.LOW_LATENCY or deepep_mode == DeepEPMode.LOW_LATENCY_OVERLAP:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
             num_qps_per_rank = num_experts // group.size()
         elif deepep_mode == DeepEPMode.AUTO:
