@@ -182,7 +182,8 @@ logger = logging.getLogger(__name__)
 
 def support_attn_input_tp_scattered(q_lora_rank):
     return (
-        q_lora_rank is not None
+        _is_cuda
+        and q_lora_rank is not None
         and not is_dp_attention_enabled()
         and not get_moe_a2a_backend().is_deepep()
     )
@@ -1283,7 +1284,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        if (
+            (not isinstance(hidden_states, tuple))
+            and hidden_states.shape[0] <= 16
+            and self.use_min_latency_fused_a_gemm
+        ):
+            qkv_latent = dsv3_fused_a_gemm(
+                hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
+            )
+        else:
+            qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+
         if use_attn_input_tp_scattered(self.q_lora_rank, forward_batch):
             qkv_latent = tp_all_gather(
                 qkv_latent, forward_batch.input_ids.shape[0], get_tp_group()
@@ -1378,23 +1389,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
-            if (
-                (not isinstance(hidden_states, tuple))
-                and hidden_states.shape[0] <= 16
-                and self.use_min_latency_fused_a_gemm
-            ):
-                fused_qkv_a_proj_out = dsv3_fused_a_gemm(
-                    hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
-                )
-            else:
-                fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            if use_attn_input_tp_scattered(self.q_lora_rank, forward_batch):
-                fused_qkv_a_proj_out = tp_all_gather(
-                    fused_qkv_a_proj_out,
-                    forward_batch.input_ids.shape[0],
-                    get_tp_group(),
-                )
-            q, latent_cache = fused_qkv_a_proj_out.split(
+            q, latent_cache = self.apply_fused_qkv_a_proj_with_mqa(
+                hidden_states, forward_batch
+            ).split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
@@ -1632,9 +1629,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
         )
         if self.q_lora_rank is not None:
-            q, latent_cache = self.apply_fused_qkv_a_proj_with_mqa(
-                hidden_states, forward_batch
-            ).split(
+            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
